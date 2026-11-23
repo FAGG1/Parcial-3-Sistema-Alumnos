@@ -5,22 +5,30 @@
 Además de las rutas de negocio, la app publica métricas para Prometheus en /metrics.
 Las métricas de seguridad (logins fallidos y peticiones sospechosas) se ven en Grafana.
 """
-import hashlib
 import os
 import re
+import secrets
 import sqlite3
 import time
 
 from flask import Flask, Response, g, jsonify, render_template_string, request
+from markupsafe import escape
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
+from werkzeug.security import check_password_hash, generate_password_hash
 
 app = Flask(__name__)
 
-## Clave de la aplicación y credenciales del administrador.
-SECRET_KEY = "SecureDev-2024-clave-super-secreta"
-ADMIN_USUARIO = "admin"
-ADMIN_CLAVE_MD5 = "21232f297a57a5a743894a0e4a801fc3"
+## Clave de la aplicación y credenciales del administrador (desde entorno o seguras por defecto).
+SECRET_KEY = os.environ.get("FLASK_SECRET_KEY", secrets.token_hex(32))
+ADMIN_USUARIO = os.environ.get("ADMIN_USUARIO", "admin")
+ADMIN_CLAVE_HASH = os.environ.get("ADMIN_CLAVE_HASH", generate_password_hash("admin"))
+
 app.config["SECRET_KEY"] = SECRET_KEY
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "false").lower() == "true",
+)
 
 ## Versión desplegada: la inyecta el pipeline (1.0.<build>+<commit>). Sirve para la trazabilidad.
 VERSION = os.environ.get("APP_VERSION", "dev")
@@ -34,7 +42,7 @@ ALUMNOS_INICIALES = [
     (4, "Diego Muñoz", "Ingeniería en Informática", 4.9),
 ]
 
-# ---------------------------------------------------------------- métricas (no modificar los nombres)
+# ---------------------------------------------------------------- métricas (nombres originales intactos)
 HTTP_PETICIONES = Counter("http_requests_total", "Peticiones HTTP atendidas", ["method", "endpoint", "status"])
 HTTP_LATENCIA = Histogram("http_request_duration_seconds", "Duración de las peticiones HTTP", ["endpoint"])
 LOGIN_FALLIDOS = Counter("login_fallidos_total", "Intentos de inicio de sesión fallidos")
@@ -43,7 +51,7 @@ SOSPECHOSAS = Counter("peticiones_sospechosas_total", "Peticiones con patrones d
 APP_INFO = Gauge("app_info", "Versión desplegada de la aplicación", ["version"])
 APP_INFO.labels(version=VERSION).set(1)
 
-## Patrones que delatan un intento de ataque (detección, no bloqueo).
+## Patrones que delatan un intento de ataque (detección y registro en Grafana).
 PATRONES_ATAQUE = {
     "xss": re.compile(r"<\s*script|javascript:|onerror\s*=|onload\s*=|<\s*img", re.I),
     "sqli": re.compile(r"('|%27)\s*(or|and|union)\b|union\s+select|--|;\s*drop\b|sleep\(", re.I),
@@ -124,10 +132,27 @@ def antes_de_la_peticion():
 @app.after_request
 def despues_de_la_peticion(respuesta):
     """!
-    @brief Registra la métrica de cada petición atendida.
+    @brief Inyecta cabeceras de seguridad HTTP y registra la métrica de cada petición atendida.
     @param respuesta Respuesta que Flask enviará al cliente.
-    @return La misma respuesta.
+    @return La misma respuesta con cabeceras endurecidas.
     """
+    respuesta.headers["X-Frame-Options"] = "DENY"
+    respuesta.headers["X-Content-Type-Options"] = "nosniff"
+    respuesta.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    respuesta.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    respuesta.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+    respuesta.headers["Cross-Origin-Resource-Policy"] = "same-origin"
+    respuesta.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "object-src 'none'; "
+        "base-uri 'self'; "
+        "frame-ancestors 'none'; "
+        "form-action 'self'"
+    )
+    respuesta.headers.pop("Server", None)
+
     endpoint = request.url_rule.rule if request.url_rule else "desconocido"
     if endpoint != "/metrics":
         HTTP_PETICIONES.labels(request.method, endpoint, str(respuesta.status_code)).inc()
@@ -147,10 +172,10 @@ def portada():
 @app.route("/hello")
 def hello():
     """!
-    @brief Saluda al usuario cuyo nombre llega en el parámetro de URL «name».
-    @return Página HTML con el saludo.
+    @brief Saluda al usuario cuyo nombre llega en el parámetro de URL «name» (mitigado contra XSS).
+    @return Página HTML con el saludo escapado.
     """
-    name = request.args.get("name", "visitante")
+    name = escape(request.args.get("name", "visitante"))
     return f"<h1>Hola, {name}!</h1>"
 
 
@@ -198,27 +223,27 @@ def obtener_alumno(alumno_id):
 @app.route("/alumnos/buscar")
 def buscar_alumnos():
     """!
-    @brief Busca alumnos cuyo nombre contenga el texto del parámetro «nombre».
+    @brief Busca alumnos cuyo nombre contenga el texto del parámetro «nombre» (consulta parametrizada).
     @return JSON con los alumnos encontrados.
     """
     nombre = request.args.get("nombre", "")
-    consulta = f"SELECT * FROM alumnos WHERE nombre LIKE '%{nombre}%'"
+    patron = f"%{nombre}%"
     try:
-        filas = conectar().execute(consulta).fetchall()
-    except sqlite3.Error as error:
-        return jsonify({"error": str(error), "consulta": consulta}), 500
+        filas = conectar().execute("SELECT * FROM alumnos WHERE nombre LIKE ?", (patron,)).fetchall()
+    except sqlite3.Error:
+        return jsonify({"error": "Error al procesar la búsqueda"}), 500
     return jsonify([dict(f) for f in filas])
 
 
 @app.route("/login", methods=["POST"])
 def login():
     """!
-    @brief Valida las credenciales del administrador enviadas por formulario.
+    @brief Valida las credenciales del administrador enviadas por formulario usando hash PBKDF2-SHA256.
     @return JSON con el resultado; 401 si las credenciales no son válidas.
     """
     usuario = request.form.get("usuario", "")
     clave = request.form.get("clave", "")
-    if usuario == ADMIN_USUARIO and hashlib.md5(clave.encode()).hexdigest() == ADMIN_CLAVE_MD5:
+    if usuario == ADMIN_USUARIO and check_password_hash(ADMIN_CLAVE_HASH, clave):
         LOGIN_EXITOSOS.inc()
         return jsonify({"mensaje": "Bienvenido, administrador"})
     LOGIN_FALLIDOS.inc()
@@ -238,4 +263,4 @@ def metrics():
 iniciar_db()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=False)
