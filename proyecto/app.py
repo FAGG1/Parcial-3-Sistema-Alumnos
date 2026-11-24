@@ -74,7 +74,9 @@ PORTADA = """<!doctype html>
   <input name="nombre" value="Ana"> <button type="submit">Buscar</button>
 </form>
 <h2>Acceso administrador</h2>
-<form action="/login" method="post">`n  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">`n  <input name="usuario" value="admin"> <input name="clave" type="password" value="">
+<form action="/login" method="post">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <input name="usuario" value="admin"> <input name="clave" type="password" value="">
   <button type="submit">Entrar</button>
 </form>
 </body>
@@ -165,7 +167,8 @@ def portada():
     @brief Portada HTML con enlaces y formularios del sistema.
     @return Página HTML.
     """
-    token = session.setdefault("csrf_token", secrets.token_hex(16))`n    return render_template_string(PORTADA, version=VERSION, csrf_token=token)
+    token = session.setdefault("csrf_token", secrets.token_hex(16))
+    return render_template_string(PORTADA, version=VERSION, csrf_token=token)
 
 
 @app.route("/hello")
