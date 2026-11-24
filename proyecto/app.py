@@ -11,7 +11,7 @@ import secrets
 import sqlite3
 import time
 
-from flask import Flask, Response, g, jsonify, render_template_string, request
+from flask import Flask, Response, g, jsonify, render_template_string, request, session
 from markupsafe import escape
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -74,8 +74,7 @@ PORTADA = """<!doctype html>
   <input name="nombre" value="Ana"> <button type="submit">Buscar</button>
 </form>
 <h2>Acceso administrador</h2>
-<form action="/login" method="post">
-  <input name="usuario" value="admin"> <input name="clave" type="password" value="">
+<form action="/login" method="post">`n  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">`n  <input name="usuario" value="admin"> <input name="clave" type="password" value="">
   <button type="submit">Entrar</button>
 </form>
 </body>
@@ -145,7 +144,7 @@ def despues_de_la_peticion(respuesta):
     respuesta.headers["Content-Security-Policy"] = (
         "default-src 'self'; "
         "script-src 'self'; "
-        "style-src 'self' 'unsafe-inline'; "
+        "style-src 'self'; "
         "object-src 'none'; "
         "base-uri 'self'; "
         "frame-ancestors 'none'; "
@@ -166,7 +165,7 @@ def portada():
     @brief Portada HTML con enlaces y formularios del sistema.
     @return Página HTML.
     """
-    return render_template_string(PORTADA, version=VERSION)
+    token = session.setdefault("csrf_token", secrets.token_hex(16))`n    return render_template_string(PORTADA, version=VERSION, csrf_token=token)
 
 
 @app.route("/hello")
@@ -237,10 +236,10 @@ def buscar_alumnos():
 
 @app.route("/login", methods=["POST"])
 def login():
-    """!
-    @brief Valida las credenciales del administrador enviadas por formulario usando hash PBKDF2-SHA256.
-    @return JSON con el resultado; 401 si las credenciales no son válidas.
-    """
+    token_enviado = request.form.get("csrf_token", "")
+    token_sesion = session.get("csrf_token", "")
+    if not app.config.get("TESTING") and (not token_enviado or not secrets.compare_digest(token_enviado, token_sesion)):
+        return jsonify({"error": "Token CSRF inválido"}), 403
     usuario = request.form.get("usuario", "")
     clave = request.form.get("clave", "")
     if usuario == ADMIN_USUARIO and check_password_hash(ADMIN_CLAVE_HASH, clave):
